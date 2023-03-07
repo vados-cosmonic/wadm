@@ -1,3 +1,4 @@
+use derive_builder::Builder;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -49,7 +50,8 @@ pub struct ActorClaims {
     pub version: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Eq, PartialEq, Clone, Builder)]
+#[builder(field(public))]
 pub struct Linkdef {
     // TODO: parse as an nkey?
     pub actor_id: String,

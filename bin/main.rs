@@ -1,3 +1,5 @@
+extern crate derive_builder;
+
 use async_nats::jetstream::{
     self,
     stream::{Config, Stream},
@@ -26,6 +28,11 @@ use wadm::consumers::*;
 use wadm::{
     commands::*, events::*, DEFAULT_COMMANDS_TOPIC, DEFAULT_EVENTS_TOPIC, DEFAULT_EXPIRY_TIME,
 };
+
+use wadm::storage::{
+    NatsKvStorageEngine,
+    NatsKvStorageConfig,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = clap::crate_name!(), version = clap::crate_version!(), about = "wasmCloud Application Deployment Manager", long_about = None)]
@@ -77,6 +84,12 @@ struct Args {
     /// The NATS JetStream domain to connect to
     #[arg(short = 'd', env = "WADM_JETSTREAM_DOMAIN")]
     domain: Option<String>,
+
+    #[arg(long = "storage-nkv-url", env = "STORAGE_NATSKV_URL")]
+    storage_nkv_url: Option<String>,
+
+    #[arg(long = "storage-nkv-prefix", env = "STORAGE_NATSKV_PREFIX")]
+    storage_nkv_prefix: Option<String>,
 }
 
 #[tokio::main]
@@ -130,14 +143,23 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
+    // Build storage adapter for lattice state (on by default)
+    let storage = NatsKvStorageEngine::new(NatsKvStorageConfig {
+        nats_url: args.storage_nkv_url.or(DEFAULT_STORAGE_NKV_URL.into()),
+        nats_prefix: args.storage_nkv_prefix,
+    })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
     let host_id = args
         .host_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     tokio::select! {
-        res = handle_events(event_stream, context.clone(), host_id) => {
+        res = handle_events(event_stream, context.clone(), host_id, storage) => {
             res?
         }
-        res = handle_commands(command_stream) => {
+        res = handle_commands(command_stream, storage) => {
             res?
         }
     }
@@ -305,13 +327,13 @@ fn configure_tracing(
         .with(log_layer);
     if !tracing_enabled && tracing_endpoint.is_none() {
         if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
-            eprintln!("Logger/tracer was already initted, continuing: {}", e);
+            eprintln!("Logger/tracer was already initted, continuing: {e}");
         }
         return;
     }
 
     let mut tracing_endpoint =
-        tracing_endpoint.unwrap_or_else(|| format!("http://localhost:55681{}", TRACING_PATH));
+        tracing_endpoint.unwrap_or_else(|| format!("http://localhost:55681{TRACING_PATH}"));
     if !tracing_endpoint.ends_with(TRACING_PATH) {
         tracing_endpoint.push_str(TRACING_PATH);
     }
@@ -342,14 +364,13 @@ fn configure_tracing(
         ),
         Err(e) => {
             eprintln!(
-                "Unable to configure OTEL tracing, defaulting to logging only: {:?}",
-                e
+                "Unable to configure OTEL tracing, defaulting to logging only: {e:?}"
             );
             tracing::subscriber::set_global_default(subscriber)
         }
     };
     if let Err(e) = res {
-        eprintln!("Logger/tracer was already initted, continuing: {}", e);
+        eprintln!("Logger/tracer was already initted, continuing: {e}");
     }
 }
 
