@@ -1,4 +1,30 @@
 use std::sync::Arc;
+extern crate derive_builder;
+
+use async_nats::jetstream::{
+    self,
+    stream::{Config, Stream},
+    Context,
+};
+use clap::Parser;
+use futures::StreamExt;
+use opentelemetry::sdk::{
+    trace::{IdGenerator, Sampler},
+    Resource,
+};
+use opentelemetry_otlp::{Protocol, WithExportConfig};
+use std::path::PathBuf;
+use tracing::{debug, error, trace, warn, Event as TracingEvent, Subscriber};
+use tracing_subscriber::fmt::{
+    format::{Format, Full, Json, Writer},
+    time::SystemTime,
+    FmtContext, FormatEvent, FormatFields,
+};
+use tracing_subscriber::{
+    layer::{Layered, SubscriberExt},
+    registry::LookupSpan,
+    EnvFilter, Layer, Registry,
+};
 
 use async_nats::jetstream::{self, stream::Config, Context};
 use clap::Parser;
@@ -14,6 +40,7 @@ use wadm::{
 };
 
 mod logging;
+use wadm::storage::{NatsAuthConfig, NatsKvStorageConfig, NatsKvStorageEngine};
 
 #[derive(Parser, Debug)]
 #[command(name = clap::crate_name!(), version = clap::crate_version!(), about = "wasmCloud Application Deployment Manager", long_about = None)]
@@ -75,6 +102,47 @@ struct Args {
         env = "WADM_MAX_JOBS"
     )]
     max_jobs: usize,
+
+    /// URL of the Nats Jetstream KV that will be used for storage
+    #[arg(long = "storage-nkv-url", env = "STORAGE_NATSKV_URL")]
+    storage_nkv_url: Option<String>,
+
+    /// Optional prefix for the server tate that will be stored.
+    /// this prefix will be prepended to the bucket name of the lattice
+    /// (ex. <prefix>_lattice_<lattice id>).
+    #[arg(
+        long = "storage-nkv-lattice-bucket-prefix",
+        env = "STORAGE_NATSKV_LATTICE_BUCKET_PREFIX"
+    )]
+    storage_nkv_lattice_bucket_prefix: Option<String>,
+
+    /// (Optional) NATS NKey authentication
+    #[arg(
+        long = "storage-nkv-nats-auth-nkey",
+        env = "STORAGE_NATSKV_NATS_AUTH_NKEY"
+    )]
+    storage_nkv_nats_auth_nkey: Option<String>,
+
+    /// (Optional) NATS credential file to use when authenticating
+    #[arg(
+        long = "storage-nkv-nats-auth-creds-file",
+        env = "STORAGE_NATSKV_NATS_AUTH_CREDS_FILE"
+    )]
+    storage_nkv_nats_auth_creds_file: Option<String>,
+
+    /// (Optional) NATS JWT seed to use when authenticating
+    #[arg(
+        long = "storage-nkv-nats-auth-jwt-seed",
+        env = "STORAGE_NATSKV_NATS_AUTH_JWT_SEED"
+    )]
+    storage_nkv_nats_auth_jwt_seed: Option<String>,
+
+    /// (Optional) NATS JWT file to use when authenticating
+    #[arg(
+        long = "storage-nkv-nats-auth-jwt-path",
+        env = "STORAGE_NATSKV_NATS_AUTH_JWT_PATH"
+    )]
+    storage_nkv_nats_auth_jwt_path: Option<String>,
 }
 
 #[tokio::main]
@@ -128,9 +196,27 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
+    // Build storage adapter for lattice state (on by default)
+    let natskv_storage_config = NatsKvStorageConfig {
+        nats_url: args
+            .storage_nkv_url
+            .unwrap_or(DEFAULT_STORAGE_NKV_URL.into()),
+        lattice_bucket_prefix: args.storage_nkv_lattice_bucket_prefix,
+        auth: Some(NatsAuthConfig {
+            creds_file: args.storage_nkv_nats_auth_creds_file,
+            jwt_seed: args.storage_nkv_nats_auth_jwt_seed,
+            jwt_path: args.storage_nkv_nats_auth_jwt_path.map(PathBuf::from),
+        }),
+    };
+
+    let storage = NatsKvStorageEngine::new(natskv_storage_config)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
     let host_id = args
         .host_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     let permit_pool = Arc::new(Semaphore::new(args.max_jobs));
     let events_manager: ConsumerManager<EventConsumer> =
         ConsumerManager::new(permit_pool.clone(), event_stream);
@@ -145,6 +231,16 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     tokio::signal::ctrl_c().await?;
+
+    tokio::select! {
+        res = handle_events(event_stream, context.clone(), host_id) => {
+            res?
+        }
+        res = handle_commands(command_stream) => {
+            res?
+        }
+    }
+
     Ok(())
 }
 
@@ -250,4 +346,143 @@ async fn send_fake_command(context: &Context, host_id: &str, event: &Event) -> a
     };
     trace!(?command, "Sending command");
     ensure_send(context, "wadm.cmd.default".to_string(), &command).await
+}
+
+async fn handle_commands(stream: Stream) -> anyhow::Result<()> {
+    let mut consumer = CommandConsumer::new(stream, "wadm.cmd.default")
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    while let Some(res) = consumer.next().await {
+        match res {
+            Err(e) => {
+                error!(error = %e, "Error when trying to fetch message from consumer");
+                continue;
+            }
+            Ok(mut cmd) => {
+                debug!(event = ?cmd.as_ref(), "Handling received command");
+                if let Err(e) = cmd.ack().await {
+                    warn!(error = %e, "Error when acking");
+                    // If we can't ack, loop back around to try on the redelivery
+                    continue;
+                }
+
+                // NOTE: There is a possible race condition here where we send the lattice control
+                // message, and it doesn't work even though we've acked the message. Worst case here
+                // is that we end up not starting/creating something, which would be fixed on the
+                // next heartbeat. This is better than the other option of double starting something
+                // when the ack fails (think if something resulted in starting 100 actors on a host
+                // and then it did it again)
+
+                // THIS IS WHERE WE'D DO REAL WORK
+                trace!("I'm sending something to the lattice control topics!");
+            }
+        }
+    }
+    Ok(())
+}
+
+const TRACING_PATH: &str = "/v1/traces";
+const DEFAULT_STORAGE_NKV_URL: &str = "localhost:4222";
+
+/// A struct that allows us to dynamically choose JSON formatting without using dynamic dispatch.
+/// This is just so we avoid any sort of possible slow down in logging code
+enum JsonOrNot {
+    Not(Format<Full, SystemTime>),
+    Json(Format<Json, SystemTime>),
+}
+
+impl<S, N> FormatEvent<S, N> for JsonOrNot
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        writer: Writer<'_>,
+        event: &TracingEvent<'_>,
+    ) -> std::fmt::Result
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        match self {
+            JsonOrNot::Not(f) => f.format_event(ctx, writer, event),
+            JsonOrNot::Json(f) => f.format_event(ctx, writer, event),
+        }
+    }
+}
+
+fn configure_tracing(
+    structured_logging: bool,
+    tracing_enabled: bool,
+    tracing_endpoint: Option<String>,
+) {
+    let env_filter_layer = get_env_filter();
+    let log_layer = get_log_layer(structured_logging);
+    let subscriber = tracing_subscriber::Registry::default()
+        .with(env_filter_layer)
+        .with(log_layer);
+    if !tracing_enabled && tracing_endpoint.is_none() {
+        if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+            eprintln!("Logger/tracer was already initialized, continuing: {e}");
+        }
+        return;
+    }
+
+    let mut tracing_endpoint =
+        tracing_endpoint.unwrap_or_else(|| format!("http://localhost:55681{TRACING_PATH}"));
+    if !tracing_endpoint.ends_with(TRACING_PATH) {
+        tracing_endpoint.push_str(TRACING_PATH);
+    }
+    let res = match opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(
+            opentelemetry_otlp::new_exporter()
+                .http()
+                .with_endpoint(tracing_endpoint)
+                .with_protocol(Protocol::HttpBinary),
+        )
+        .with_trace_config(
+            opentelemetry::sdk::trace::config()
+                .with_sampler(Sampler::AlwaysOn)
+                .with_id_generator(IdGenerator::default())
+                .with_max_events_per_span(64)
+                .with_max_attributes_per_span(16)
+                .with_max_events_per_span(16)
+                .with_resource(Resource::new(vec![opentelemetry::KeyValue::new(
+                    "service.name",
+                    "wadm",
+                )])),
+        )
+        .install_batch(opentelemetry::runtime::Tokio)
+    {
+        Ok(t) => tracing::subscriber::set_global_default(
+            subscriber.with(tracing_opentelemetry::layer().with_tracer(t)),
+        ),
+        Err(e) => {
+            eprintln!("Unable to configure OTEL tracing, defaulting to logging only: {e:?}");
+            tracing::subscriber::set_global_default(subscriber)
+        }
+    };
+    if let Err(e) = res {
+        eprintln!("Logger/tracer was already initialized, continuing: {e}");
+    }
+}
+
+fn get_log_layer(structured_logging: bool) -> impl Layer<Layered<EnvFilter, Registry>> {
+    let log_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(atty::is(atty::Stream::Stderr));
+    if structured_logging {
+        log_layer.event_format(JsonOrNot::Json(Format::default().json()))
+    } else {
+        log_layer.event_format(JsonOrNot::Not(Format::default()))
+    }
+}
+
+fn get_env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|e| {
+        eprintln!("RUST_LOG was not set or the given directive was invalid: {e:?}\nDefaulting logger to `info` level");
+        EnvFilter::default().add_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+    })
 }
