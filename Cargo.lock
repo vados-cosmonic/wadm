@@ -1240,6 +1240,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "port_check"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6519412c9e0d4be579b9f0618364d19cb434b324fc6ddb1b27b1e682c7105ed"
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2337,6 +2343,7 @@ dependencies = [
  "nkeys",
  "opentelemetry",
  "opentelemetry-otlp",
+ "port_check",
  "prometheus",
  "semver",
  "serde",

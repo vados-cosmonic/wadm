@@ -1,9 +1,15 @@
-#![allow(dead_code)]
+use tokio::process::Child;
 use tokio::process::Command;
 
-const WASHBOARD_URL: &str = "localhost:4000";
+use anyhow::Result;
 
+const DEFAULT_WASMCLOUD_PORT: u16 = 4000;
+const DEFAULT_NATS_PORT: u16 = 4222;
+
+#[derive(Debug)]
 pub struct CleanupGuard {
+    child: Option<Child>,
+
     already_running: bool,
 }
 
@@ -24,28 +30,132 @@ impl Drop for CleanupGuard {
     }
 }
 
-// TODO: Make this actually be unique for each test so we can run in parallel
-pub async fn setup_test() -> CleanupGuard {
-    // Start wasmcloud host if we don't find one running
-    let already_running = if tokio::net::TcpStream::connect(WASHBOARD_URL).await.is_err() {
-        let output = Command::new("wash")
-            // NOTE: NATS server should have been started prior (ex. via Makefile)
-            .args(["up", "-d", "--nats-connect-only"])
-            .status()
-            .await
-            .expect("Unable to run wash up");
-        assert!(output.success(), "Error trying to start host",);
-        // Make sure we can connect
-        wait_for_server(WASHBOARD_URL).await;
-        // Give the host just a bit more time to spin up. If we don't wait, sometimes the host isn't
-        // totally ready
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        false
-    } else {
-        true
+/// Configuration struct for wash instances that are used for testing
+#[derive(Debug)]
+pub struct TestWashConfig {
+    /// Port on which to run wasmCloud
+    pub nats_port: Option<u16>,
+
+    /// Only connect to pre-existing NATS instance
+    pub nats_connect_only: bool,
+
+    /// Port on which to run wasmCloud (via `wash up`)
+    pub wasmcloud_port: Option<u16>,
+
+    /// Whether wash should detach (-d)
+    pub detach: bool,
+}
+
+impl Default for TestWashConfig {
+    fn default() -> TestWashConfig {
+        TestWashConfig {
+            nats_port: None,
+            nats_connect_only: false,
+            wasmcloud_port: None,
+            detach: false,
+        }
+    }
+}
+
+impl TestWashConfig {
+    /// Build a test wash configuration with randomized ports
+    pub async fn random() -> Result<TestWashConfig> {
+        let nats_port = port_check::free_local_port();
+        let wasmcloud_port = port_check::free_local_port();
+
+        Ok(TestWashConfig {
+            nats_port,
+            wasmcloud_port,
+            ..TestWashConfig::default()
+        })
+    }
+
+    /// Get the washboard URL for this config
+    pub fn washboard_url(&self) -> String {
+        format!(
+            "localhost:{}",
+            self.wasmcloud_port
+                .unwrap_or(DEFAULT_WASMCLOUD_PORT)
+                .to_string()
+        )
+    }
+
+    /// Get the NATS URL for this config
+    pub fn nats_url(&self) -> String {
+        format!(
+            "127.0.0.1:{}",
+            self.nats_port.unwrap_or(DEFAULT_NATS_PORT).to_string()
+        )
+    }
+}
+
+/// Start a local wash instance
+async fn start_wash_instance(cfg: &TestWashConfig) -> Result<CleanupGuard> {
+    let nats_port = cfg.nats_port.unwrap_or(DEFAULT_NATS_PORT).to_string();
+    let wasmcloud_port = cfg
+        .wasmcloud_port
+        .unwrap_or(DEFAULT_WASMCLOUD_PORT)
+        .to_string();
+
+    // Build args
+    let mut args: Vec<&str> = Vec::from(["up", "--nats-port", &nats_port]);
+    if cfg.detach {
+        args.push("-d");
+    }
+    if cfg.nats_connect_only {
+        args.push("--nats-connect-only");
+    }
+
+    // Build the command
+    let mut cmd = Command::new("wash");
+    cmd.args(&args)
+        .env("WASMCLOUD_PORT", &wasmcloud_port)
+        .env("WASMCLOUD_DASHBOARD_PORT", &wasmcloud_port)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+
+    // Build the cleanup guard that will be returned
+    let mut guard = CleanupGuard {
+        child: None,
+        already_running: false,
     };
 
-    CleanupGuard { already_running }
+    // Launch command either detached or as an active child process
+    if cfg.detach {
+        // NOTE: In the detached case, we expect NATS to have been started prior (ex. via Makefile)
+        //
+        // Detached exeuction should finish immediately and return
+        let output = cmd.status().await.expect("Unable to run detached wash up");
+        assert!(output.success(), "Error trying to start host",);
+    } else {
+        // If doing a continuous execution, spawn into another thread
+        // and hold on to the child process handle in the guard
+        guard.child = Some(cmd.spawn()?);
+    }
+
+    // Make sure we can connect to washboard
+    wait_for_server(&cfg.washboard_url()).await;
+
+    // Give the host just a bit more time to get totally ready
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    Ok(guard)
+}
+
+/// Set up and run a wash instance that can be used for a test
+pub async fn setup_test_wash(cfg: &TestWashConfig) -> CleanupGuard {
+    match tokio::net::TcpStream::connect(cfg.washboard_url()).await {
+        Err(_) => start_wash_instance(&cfg)
+            .await
+            .unwrap_or_else(|_| CleanupGuard {
+                child: None,
+                already_running: false,
+            }),
+        Ok(_) => CleanupGuard {
+            child: None,
+            already_running: true,
+        },
+    }
 }
 
 pub async fn wait_for_server(url: &str) {
