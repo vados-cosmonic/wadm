@@ -30,7 +30,9 @@ jobs:
           key: "${{ matrix.os }}-rust-cache"
 
       - name: install wash
-        run: cargo install --version ${{ matrix.wash_version }} wash-cli 
+        run: |
+          cargo install --version ${{ matrix.wash_version }} wash-cli
+          echo "/home/runner/.cargo/bin" >> $GITHUB_PATH
 
       # GH Actions doesn't currently support passing args to service containers and there is no way
       # to use an environment variable to turn on jetstream for nats, so we manually start it here
